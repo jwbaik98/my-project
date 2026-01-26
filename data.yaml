@@ -1,0 +1,10 @@
+# data.yaml 예시
+path: C:/Users/Administrator/Desktop/PTU/v17_mini_project  # 프로젝트 루트 경로
+train: C:/Users/Administrator/Desktop/PTU/v17_mini_project/0. Dataset/1.Training/TS5_표고   # images 폴더가 들어있는 세부 경로
+val: C:/Users/Administrator/Desktop/PTU/v17_mini_project/0. Dataset/2.Validation/VS5_표고     # validation 사진이 들어있는 세부 경로
+test: # (없으면 비워둠)
+
+names:
+  0: Culture
+  1: Growth
+  2: Disease
