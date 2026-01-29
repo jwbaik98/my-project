@@ -4,189 +4,389 @@ from PIL import Image
 import cv2
 import numpy as np
 import os
-import json
+import csv
+import re
+from datetime import datetime
+from llama_cpp import Llama
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import sys
+import signal
+from PIL import ImageDraw, ImageFont
 
-# 1. 페이지 설정
-st.set_page_config(page_title="Mushroom AI Care", page_icon="🍄", layout="wide")
+# 1. 가상환경의 패키지 저장소 절대 경로 계산
+base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+site_packages_path = os.path.join(base_path, "py310", "Lib", "site-packages")
 
-# --- UI 스타일 함수 ---
-def apply_custom_css(theme):
-    if theme == "Dark (블랙)":
-        bg, s_bg, txt, c_bg, bord = "#0e1117", "#1c1e26", "#ffffff", "#262936", "#3e4251"
-    else:
-        bg, s_bg, txt, c_bg, bord = "#ffffff", "#f0f2f6", "#000000", "#f8f9fa", "#d1d8e0"
-    
-    st.markdown(f"""
-        <style>
-        header {{ visibility: hidden; height: 0px !important; }}
-        .block-container {{ padding-top: 0px !important; }}
-        .stApp {{ background-color: {bg}; color: {txt}; }}
-        .main-header {{ background: {c_bg}; padding: 12px; border-radius: 0 0 20px 20px; border: 1px solid {bord}; text-align: center; margin-bottom: 15px; color: {txt}; }}
-        .stImage img {{ max-height: 400px; object-fit: contain; width: auto !important; margin: 0 auto; display: block; }}
-        [data-testid="stSidebar"] {{ background-color: {s_bg} !important; }}
-        [data-testid="stSidebar"] * {{ color: {txt} !important; }}
-        .result-card {{ background: {c_bg}; padding: 10px; border-radius: 10px; border: 1px solid {bord}; margin-bottom: 8px; color: {txt}; }}
-        .mode-status {{ background: #4A90E2; color: white !important; padding: 5px; border-radius: 5px; text-align: center; font-weight: bold; }}
-        </style>
-    """, unsafe_allow_html=True)
-    return bg, s_bg, txt, c_bg, bord # 변수를 반환하여 다른 곳에서 쓸 수 있게 함
+# 2. 파이썬 경로 리스트 맨 앞에 추가 (우선순위 1위)
+if site_packages_path not in sys.path:
+    sys.path.insert(0, site_packages_path)
 
-# --- 유틸리티 함수 (공정 판독 등) ---
-def classify_process_simple(box_w, box_h):
-    aspect_ratio = box_h / box_w if box_w > 0 else 0
-    if aspect_ratio > 1.4:
-        return "Incubation", "배양 단계"
-    return "Growth", "생육 단계"
+# 3. 디버깅 출력 (나중에 확인용)
+print(f"Searching in: {site_packages_path}")
 
-# --- 2. 모델 및 매핑 데이터 로드 ---
+try:
+    from llama_cpp import Llama
+except ImportError as e:
+    print(f"Import Error details: {e}")
+    # 만약 실패하면 여기서 실행 중단
+    raise e
+
+# --- [1. 세션 상태 초기화] ---
+if 'run_cam' not in st.session_state:
+    st.session_state.run_cam = False
+if 'last_ai_res' not in st.session_state:
+    st.session_state.last_ai_res = "분석 대기 중..."
+if 'prev_status' not in st.session_state:
+    st.session_state.prev_status = ""
+
+st.set_page_config(page_title="표고버섯 AI 판독기", page_icon="🍄", layout="wide")
+
+# --- [2. CSV 저장 (한글 깨짐 방지)] ---
+def save_feedback(status, context, answer, score):
+    log_file = 'mushroom_ai_feedback.csv'
+    file_exists = os.path.isfile(log_file)
+    with open(log_file, mode='a', encoding='utf-8-sig', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(['일시', '진단상태', '참고문헌', 'AI답변', '사용자평가'])
+        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), status, context, answer, score])
+
+# --- [3. AI 답변 정제 함수] ---
+def clean_ai_answer(text):
+    text = text.replace("**", "").replace("#", "").strip()
+    # 영문 찌꺼기 제거 및 정리
+    text = re.sub(r'[a-zA-Z]{10,}', '', text) 
+    return text
+
+# --- [4. 모델 로드] ---
 @st.cache_resource
-def load_yolo_model():
+def init_all_models():
+    # 1. 경로 설정 (배치 파일 실행 환경 고려)
     curr_dir = os.path.dirname(os.path.abspath(__file__))
-    paths = [os.path.join(curr_dir, "best.pt"), "best.pt"]
-    for path in paths:
-        if os.path.exists(path):
-            return YOLO(path), path
-    return None, None
+    
+    # 2. YOLO 모델 로드
+    yolo_path = os.path.join(curr_dir, 'best.pt')
+    yolo = YOLO(yolo_path)    
 
-@st.cache_data
-def load_disease_mapping():
-    mapping_path = os.path.join(os.path.dirname(__file__), "mapping.json")
-    if os.path.exists(mapping_path):
-        with open(mapping_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
+    # 3. 임베딩 모델 및 매뉴얼 로드 (RAG 설정)
+    embed_model = None
+    chunks = []
+    embeddings = []
+    
+    try:
+        # 한국어 성능이 좋은 모델로 명시적 생성
+        embed_model = SentenceTransformer('jhgan/ko-sroberta-multitask')
+        
+        manual_path = os.path.join(curr_dir, 'mushroom_manual.txt')
+        if os.path.exists(manual_path):
+            with open(manual_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                # 간단한 청킹 (문단 단위)
+                chunks = [p.strip() for p in content.split('\n\n') if p.strip()]
+                embeddings = embed_model.encode(chunks)
+        else:
+            st.error(f"매뉴얼 파일을 찾을 수 없습니다: {manual_path}")
+    except Exception as e:
+        st.warning(f"임베딩 모델 로드 중 오류 발생: {e}")
 
-# 모델 로드
-model, model_path = load_yolo_model()
-disease_lookup = load_disease_mapping()
+    # 4. LLM(Gemma) 모델 로드
+    llm = None
+    try:
+        gguf_files = [f for f in os.listdir(curr_dir) if f.endswith('.gguf')]
+        if gguf_files:
+            # 가장 용량이 큰 GGUF 파일을 자동으로 선택
+            model_path = os.path.join(curr_dir, max(gguf_files, key=lambda f: os.path.getsize(os.path.join(curr_dir, f))))
+            llm = Llama(model_path=model_path, n_ctx=512)
+        else:
+            st.error("GGUF 모델 파일이 app 폴더에 없습니다.")
+    except Exception as e:
+        st.error(f"LLM 로드 실패: {e}")
 
-# --- 3. 사이드바 설정 ---
+    # 모든 변수가 값이 있든 None이든 반환되도록 보장
+    return yolo, embed_model, chunks, embeddings, llm
+
+yolo_model, embed_model, chunks, embeddings, llm_model = init_all_models()
+
+def search_rag(query, k=2):
+    if not chunks: return "매뉴얼을 참고하세요."
+    query_vec = embed_model.encode([query])
+    distances = cosine_similarity(query_vec, embeddings)[0]
+    top_indices = distances.argsort()[-k:][::-1]
+    return "\n".join([chunks[i] for i in top_indices])
+
+# --- [5. UI 스타일] ---
+def apply_custom_css(theme):
+    bg, txt, c_bg = ("#ffffff", "#000000", "#f8f9fa") if theme == "Light (화이트)" else ("#0e1117", "#ffffff", "#262936")
+    st.markdown(f"""<style>
+        .stApp {{ background-color: {bg}; color: {txt}; }}
+        .main-header {{ background: {c_bg}; padding: 15px; border-radius: 20px; text-align: center; margin-bottom: 25px; border: 1px solid #ddd; }}
+        .ai-box {{ background: {c_bg}; border-left: 5px solid #4CAF50; padding: 20px; border-radius: 12px; line-height: 1.8; }}
+        .result-card {{ background: {c_bg}; padding: 15px; border-radius: 10px; border: 1px solid #ddd; margin-bottom: 12px; }}
+        .loading-text {{ color: #FF9800; font-weight: bold; font-size: 1.1rem; margin: 15px 0; animation: blink 1.5s infinite; }}
+        @keyframes blink {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} 100% {{ opacity: 1; }} }}
+    </style>""", unsafe_allow_html=True)
+
 with st.sidebar:
-    st.markdown("### ⚙️ 설정")
-    # 순서를 Light를 앞으로 두어 화이트 버전으로 기본 고정
-    theme = st.radio("🎨 테마", ["Light (화이트)", "Dark (블랙)"], index=0)
-    st.markdown("---")
-    conf_v = st.slider("🎯 민감도", 0.01, 1.0, 0.25)
-    iou_v = st.slider("📏 중복 제거", 0.1, 0.9, 0.35)
-    st.markdown("---")
+    st.title("🍄 설 정")
+    theme = st.radio("🎨 테마", ["Light (화이트)", "Dark (블랙)"])
     mode = st.selectbox("🖥️ 분석 모드", ["📸 사진 분석", "📹 실시간 영상"])
-    st.markdown(f'<div class="mode-status">현재: {mode}</div>', unsafe_allow_html=True)
+    conf_v = st.slider("🎯 탐지 민감도", 0.1, 1.0, 0.3)
+    iou_v = st.slider("중복제거", 0.1, 0.9, 0.35)
 
-# 테마 적용 및 색상 변수 가져오기
-bg, s_bg, txt, c_bg, bord = apply_custom_css(theme)
+apply_custom_css(theme)
+st.markdown('<div class="main-header"><h1>🍄 표고버섯 AI 판독기</h1></div>', unsafe_allow_html=True)
 
-if model is None:
-    st.error("❌ 모델 파일(best.pt)이 없습니다.")
-    st.stop()
+disease_lookup = {"dis": "푸른곰팡이병", "mold": "털곰팡이병", "spot": "갈색점무늬병"}
 
-# --- 4. 메인 화면 로직 ---
-st.markdown(f'<div class="main-header"><h2>🍄 표고버섯 AI 스마트 진단</h2></div>', unsafe_allow_html=True)
+# --- [6. 분석 로직] ---
 
 if mode == "📸 사진 분석":
-    col1, col2 = st.columns([1, 1])
+    col1, col2 = st.columns([1.2, 1])
+    boxes = []
+    
     with col1:
-        st.write("### 🖼️ 사진 업로드")
-        f = st.file_uploader("이미지", type=["jpg", "png", "jpeg"], label_visibility="collapsed")
+        f = st.file_uploader("이미지 업로드", type=["jpg", "png", "jpeg"])
         if f:
-            img = Image.open(f)
-            res = model.predict(img, conf=conf_v, iou=iou_v)
-            st.image(res[0].plot(), use_container_width=True)
+            img = Image.open(f).convert("RGB") # 형식 통일
+            # [수정 1] classes 옵션을 제거하여 모든 학습 객체(배지 포함)를 탐지하도록 함
+            res = yolo_model.predict(img, conf=conf_v, iou=iou_v) 
             boxes = res[0].boxes
-
-    with col2:
-        st.write("### 📊 진단 리포트")
-        if f and 'boxes' in locals():
-            st.markdown(f'<div class="result-card"><b>총 탐지:</b> {len(boxes)}개</div>', unsafe_allow_html=True)
-            has_growth = any(any(k in model.names[int(b.cls[0])].lower() for k in ['grow', 'mush', 'obj']) for b in boxes)
+            
+            draw_img = img.copy()
+            draw = ImageDraw.Draw(draw_img)
+            
+            # [수정 2] 폰트 크기를 이미지 크기에 비례하게 조정 (자동 스케일링)
+            font_size = max(20, int(img.size[0] / 30))
+            try:
+                # 윈도우 기본 폰트 경로 시도, 없으면 기본 폰트
+                font = ImageFont.truetype("arial.ttf", font_size)
+            except:
+                font = ImageFont.load_default()
 
             for i, box in enumerate(boxes):
-                label_idx = int(box.cls[0])
-                raw_label = model.names[label_idx]
-                label = raw_label.lower()
-                score = float(box.conf[0]) * 100
                 xyxy = box.xyxy[0].tolist()
-                w, h = xyxy[2]-xyxy[0], xyxy[3]-xyxy[1]
-                img_h, img_w = res[0].orig_shape
-                ratio = (w * h) / (img_w * img_h)
-                aspect = h / w if w > 0 else 0
-                size = np.sqrt(w**2 + h**2)
-                days = int(7 + (size / 60))
-                growth_detail = f"생육 {min(days, 14)}일차"
+                label_idx = int(box.cls[0])
+                label_name = yolo_model.names[label_idx].lower()
+                
+                # 색상 결정 (병해: 빨강, 나머지: 초록)
+                rect_color = (255, 82, 82) if 'dis' in label_name or 'mold' in label_name else (76, 175, 80)
+                
+                # 박스 및 번호 그리기
+                draw.rectangle(xyxy, outline=rect_color, width=5)
+                label_text = f"#{i+1}"
+                
+                # 텍스트 배경 상자
+                tw, th = draw.textbbox((xyxy[0], xyxy[1]), label_text, font=font)[2:]
+                draw.rectangle((xyxy[0], xyxy[1], tw, th), fill=rect_color)
+                draw.text((xyxy[0], xyxy[1]), label_text, fill=(255, 255, 255), font=font)
 
-                if 'dis' in label:
-                    file_key = f.name.split('.')[0]
-                    disease_name = disease_lookup.get(file_key, "미분류 병해")
-                    k_name, s_color = f"병해({disease_name})", "#FF5252"
-                    detail = f"⚠️ 즉시 격리 및 방제 필요 | {growth_detail}"
-                elif any(k in label for k in ['grow', 'obj', 'mush']):
-                    k_name, s_color = "버섯(생육)", "#4CAF50"
-                    detail = f"{growth_detail} (정상)"
-                elif ratio > 0.25 or aspect > 1.6 or 'cul' in label:
-                    if has_growth: continue
-                    k_name, s_color, detail = "배지(배양봉)", "#4A90E2", "배양 상태 확인 중"
-                else:
-                    k_name, s_color, detail = f"기타({raw_label})", "#888888", growth_detail
+            st.image(draw_img, caption="AI 탐지 결과 (순번 표시)", width=400)
 
-                st.markdown(f"""
-                <div class="result-card">
-                    <b>#{i+1} {k_name}</b> <span style="color:{s_color};">●</span><br>
-                    <small>분류: {raw_label} | 확신도: {score:.1f}%</small><br>
-                    <div style="margin-top:5px; font-weight:bold; color:{s_color};">{detail}</div>
-                </div>
-                """, unsafe_allow_html=True)
+    with col2:
+        st.write("### 📊 상세 진단 리포트")
+        if not f:
+            st.info("💡 왼쪽에서 사진을 업로드해 주세요.")
+        elif len(boxes) == 0:
+            st.warning("🔍 탐지된 객체가 없습니다. 배지가 잘 보이도록 찍어주세요.")
         else:
-            st.info("사진을 업로드하면 실시간 리포트가 생성됩니다.")
-
-elif mode == "📹 실시간 영상":
-    st.write("### 📹 실시간 통합 모니터링")
-    run_cam = st.toggle("카메라 가동")
-    
-    col_vid, col_rep = st.columns([1.5, 1])
-    with col_vid:
-        st_frame = st.empty() 
-    with col_rep:
-        st.subheader("📋 실시간 분석 리포트")
-        report_area = st.empty() 
-
-    if run_cam:
-        cap = cv2.VideoCapture(0)
-        while cap.isOpened() and run_cam:
-            ret, frame = cap.read()
-            if not ret:
-                st.error("카메라 연결에 실패했습니다.")
-                break
+            st.markdown(f'<div class="result-card"><b>총 탐지:</b> {len(boxes)}개</div>', unsafe_allow_html=True)
+            status_for_ai = []
             
-            res = model.predict(frame, conf=conf_v, iou=iou_v, verbose=False)
-            all_cards_html = ""
+            for i, box in enumerate(boxes):
+                label_idx = int(box.cls[0])
+                label_raw = yolo_model.names[label_idx].lower()
+                score = float(box.conf[0]) * 100
+                
+                # [수정 3] 배양 상태인지 생육 상태인지 구분하여 리포트 작성
+                if 'dis' in label_raw or 'mold' in label_raw:
+                    d_name = disease_lookup.get(label_raw[:3], "병해 발생")
+                    k_name, s_color = f"위험({d_name})", "#FF5252"
+                    detail = "⚠️ 즉시 격리 및 소독이 필요합니다."
+                    status_for_ai.append(d_name)
+                else:
+                    k_name, s_color = "정상 상태", "#4CAF50"
+                    detail = "✅ 균사 배양 또는 생육이 양호합니다."
+                    status_for_ai.append("정상")
+
+                st.markdown(f'''
+                    <div class="result-card" style="border-left: 5px solid {s_color};">
+                        <b>#{i+1} {k_name}</b> (확신도: {score:.1f}%)<br>
+                        <span style="color:{s_color};">{detail}</span>
+                    </div>
+                ''', unsafe_allow_html=True)
+
+# 2. AI 처방전 섹션
+            if llm_model and len(status_for_ai) > 0:
+                st.markdown("---")
+                loading_placeholder = st.empty()
+                loading_placeholder.markdown('<div class="loading-text">⏳ 버섯 전문가가 진단서를 작성하고 있습니다...</div>', unsafe_allow_html=True)
+
+                diseases_only = [s for s in status_for_ai if s != "정상"]
+                target_status = diseases_only[0] if diseases_only else "정상 생육"
+                
+                current_context = search_rag(target_status)
+                # 매뉴얼 제목이나 '데이터'라는 단어가 들어가면 AI가 헷갈리므로 삭제
+                clean_context = current_context.replace("표고버섯 재배 통합 매뉴얼", "").replace("최종 TXT용 데이터", "").replace("~", "에서 ")
+
+                # [수정] 프롬프트를 "명령"이 아닌 "작성 중인 문서"처럼 구성합니다.
+                # 소형 모델은 '조언해라'라는 명령보다 '이미 조언을 쓰고 있는 상황'을 더 잘 흉내냅니다.
+                prompt = f"""베테랑 농촌지도사의 조언 보고서
+                            대상 상태: {target_status}
+                            참고자료: {clean_context[:400]}
+
+                            보고서 내용:
+                            농민 여러분, 현재 발생한 {target_status} 확산을 막기 위해 다음 조치를 즉시 취하십시오.
+
+                            1. 우선 가장 시급한 것은 """
+
+                try:
+                    output = llm_model(
+                        prompt, 
+                        max_tokens=400, 
+                        temperature=0.3, # 낮을수록 헛소리가 줄어듭니다.
+                        repeat_penalty=1.6, # 자기 말을 베끼는 것을 강하게 방지
+                        stop=["[", "참고", "조언해", "규칙", "지침", "데이터"], # AI가 헷갈려할 키워드들에서 멈춤
+                        echo=False
+                    )
+                    
+                    full_text = output.strip() if isinstance(output, str) else output['choices'][0]['text'].strip()
+
+                    # 후처리 필터링
+                    import re
+                    raw_lines = full_text.split('\n')
+                    clean_advice = []
+                    
+                    # AI가 역으로 질문하거나 지시사항을 베낀 줄을 필터링하는 블랙리스트
+                    blacklist = ["제공해주세요", "참고하여", "해결책과", "조언을", "정보가 있습니다", "이해를 높여", "도움이 될"]
+
+                    for line in raw_lines:
+                        line = line.strip()
+                        # 블랙리스트 단어가 들어있거나 영어가 4자 이상이면 삭제
+                        if any(bad in line for bad in blacklist) or re.search(r'[a-zA-Z]{4,}', line):
+                            continue
+                        
+                        if len(line) > 10:
+                            # 번호 제거
+                            line = re.sub(r'^\d+\.\s*|^-\s*', '', line)
+                            clean_advice.append(line)
+
+                    if len(clean_advice) >= 1:
+                        final_output = f"🍄 **[AI 전문가 긴급 처방전: {target_status}]**\n\n"
+                        # 첫 문장에 유도구 생략되었을 경우 보정
+                        if not clean_advice[0].startswith("우선 가장 시급한 것은"):
+                            clean_advice[0] = "우선 가장 시급한 것은 " + clean_advice[0]
+                            
+                        for idx, advice in enumerate(clean_advice[:4]):
+                            final_output += f"{idx+1}. {advice}\n\n"
+                        ans = final_output
+                    else:
+                        raise ValueError("유효한 답변 부족")
+
+                except Exception as e:
+                    # AI가 엉뚱한 소리를 할 때 보여줄 안전한 기본 처방전
+                    ans = f"⚠️ **{target_status} 긴급 대응 지침**\n\n"
+                    ans += "1. 재배사 내 습도를 80% 이하로 낮추고 환풍기를 가동하십시오.\n\n"
+                    ans += "2. 푸른곰팡이가 발생한 부위는 포자가 날리지 않게 조심스럽게 제거하십시오.\n\n"
+                    ans += "3. 도구와 장화는 반드시 소독 후 사용해 추가 확산을 방지하십시오."
+
+                loading_placeholder.empty()
+                st.info(ans)
+
+                # 피드백 버튼
+                c1, c2, c3 = st.columns(3)
+                if c1.button("👍 좋아요", key="btn_good_ai"): st.toast("피드백이 반영되었습니다!")
+                if c2.button("👎 별로예요", key="btn_bad_ai"): st.toast("더 나은 답변을 위해 노력하겠습니다.")
+                if c3.button("🔄 재연산", key="btn_rerun_ai"): st.rerun()
+                
+elif mode == "📹 실시간 영상":
+    st.write("### 📹 실시간 모니터링")
+    run_cam = st.toggle("카메라 가동", value=st.session_state.run_cam)
+    st.session_state.run_cam = run_cam
+    
+    v_col, r_col = st.columns([1.5, 1])
+    with v_col: st_frame = st.empty()
+    with r_col:
+        report_area = st.empty()
+        st.markdown("---")
+        ai_area = st.empty()
+
+    if st.session_state.run_cam:
+        cap = cv2.VideoCapture(0)
+        frame_idx = 0
+        
+        while st.session_state.run_cam:
+            ret, frame = cap.read()
+            if not ret: break
+            
+            # YOLO 탐지 (속도를 위해 verbose=False)
+            res = yolo_model.predict(frame, conf=conf_v, iou=iou_v, verbose=False)
+            
+            # 1. 화면 출력 (경고 해결: use_container_width 사용)
+            st_frame.image(res[0].plot(), channels="BGR", use_container_width=True)
             
             if len(res[0].boxes) > 0:
-                for i, box in enumerate(res[0].boxes):
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    w, h = x2-x1, y2-y1
-                    label_name = model.names[int(box.cls[0])].lower()
-                    proc_key, proc_name = classify_process_simple(w, h)
-                    is_dis = any(k in label_name for k in ['dis', 'mold', 'spot', 'wilt'])
-                    
-                    if is_dis:
-                        status_title, status_color = "⚠️ 질병 의심", "#FF5252"
-                        detail_text = "즉시 격리 필요"
-                    else:
-                        status_title, status_color = "✅ 정상 생육", "#4CAF50"
-                        size = np.sqrt(w**2 + h**2)
-                        days = int(7 + (size / 60))
-                        detail_text = f"생육 {min(days, 14)}일차"
+                # 가장 확실한 객체 하나 선택
+                top_box = res[0].boxes[0]
+                label_idx = int(top_box.cls[0])
+                label_raw = yolo_model.names[label_idx].lower()
+                
+                # 질병명 매칭
+                d_name = "정상"
+                for k, v in disease_lookup.items():
+                    if k in label_raw:
+                        d_name = v
+                        break
+                
+                report_area.markdown(f'<div class="result-card"><b>현재 상태:</b> {d_name}</div>', unsafe_allow_html=True)
 
-                    all_cards_html += f"""
-                    <div class="result-card" style="border-left: 6px solid {status_color};">
-                        <b style="color: {status_color}; font-size: 1.1rem;">#{i+1} {status_title}</b><br>
-                        <div style="margin-top: 5px; font-size: 0.8rem;">
-                            <b>구분:</b> {proc_name} | <b>상태:</b> {detail_text}
-                        </div>
+                # 2. AI 분석 주기 최적화 (30프레임마다 상태 체크, 변화 있을 때만 실행)
+                if frame_idx % 30 == 0:
+                    if d_name != st.session_state.prev_status:
+                        # 상태가 변했을 때만 AI 처방전 갱신
+                        with st.spinner(f"⚕️ {d_name} 대응 지침 생성 중..."):
+                            current_context = search_rag(d_name)
+                            prompt = f"""베테랑 농촌지도사의 조언
+상태: {d_name}
+지침: {current_context[:300]}
+
+보고서:
+농민 여러분, {d_name} 방제를 위해 다음을 실천하세요.
+1. """
+                            try:
+                                output = llm_model(
+                                    prompt, 
+                                    max_tokens=200, # 속도를 위해 토큰 수 제한
+                                    temperature=0.2,
+                                    stop=["3.", "###"], # 짧고 굵게 2가지만 출력
+                                    echo=False
+                                )
+                                ans_text = "1. " + output['choices'][0]['text'].strip()
+                                st.session_state.last_ai_res = ans_text
+                                st.session_state.prev_status = d_name
+                            except:
+                                st.session_state.last_ai_res = "분석 일시 지연 (재시도 중)"
+
+                # AI 결과 표시 (루프 내내 유지)
+                ai_area.markdown(f'''
+                    <div class="ai-box">
+                        <b>⚕️ 실시간 전문가 처방 ({d_name})</b><br>
+                        {st.session_state.last_ai_res}
                     </div>
-                    """
-            else:
-                all_cards_html = f"<p style='color:{txt};'>현재 탐지된 객체가 없습니다.</p>"
+                ''', unsafe_allow_html=True)
 
-            st_frame.image(res[0].plot(), channels="BGR", use_container_width=True)
-            report_area.markdown(all_cards_html, unsafe_allow_html=True)
+            frame_idx += 1
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
+            
         cap.release()
+        
+# 사이드바 맨 아래에 종료 버튼 배치
+if st.sidebar.button("🛑 Exit Program"):
+    placeholder = st.empty() # 메인 화면 영역 확보
+    with placeholder.container():
+        st.error("### 🏁 시스템이 완전히 종료되었습니다.")
+        st.write("보안을 위해 이 브라우저 탭을 닫아주십시오.")
+    
+    # 프로세스 종료 실행
+    import os, signal
+    os.kill(os.getpid(), signal.SIGTERM)
