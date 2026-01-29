@@ -14,10 +14,10 @@
 ::dAsiuh18IRvcCxnZtBJQ
 ::cRYluBh/LU+EWAnk
 ::YxY4rhs+aU+IeA==
-::cxY6rQJ7JhzQF1fEqQJgZko0
-::ZQ05rAF9IBncCkqN+0xwdVs0
-::ZQ05rAF9IAHYFVzEqQI9PQhcXguNMVS+A6EZ6/yb
-::eg0/rx1wNQPfEVWB+kM9LVsJDGQ=
+::cxY6rQJ7JhzQF1fEqQJQ
+::ZQ05rAF9IBncCkqN+0xwdVsEAlXi
+::ZQ05rAF9IAHYFVzEqQK92efen8QJ7o824no9wWUXH2FoR8fFhKoTVKJQCFAC4ARaig==
+::eg0/rx1wNQPfEVWB+kM9LVsJDIlzwOFpxj7ODGQfIMuuL6Ht3w3a8lcLug==
 ::fBEirQZwNQPfEVWB+kM9LVsJDGQ=
 ::cRolqwZ3JBvQF1fEqQJQ
 ::dhA7uBVwLU+EWDk=
@@ -26,7 +26,7 @@
 ::ZQ0/vhVqMQ3MEVWAtB9wSA==
 ::Zg8zqx1/OA3MEVWAtB9wSA==
 ::dhA7pRFwIByZRRnk
-::Zh4grVQjdCyDJGyX8VAjFDpQQQ2MNXiuFLQI5/rHy++UqVkSRN4ybZzTyLuBLd8S+lXbcZ8+wkZXjdgEHhRXcy2vaxsxqnoMs3yAVw==
+::Zh4grVQjdCyDJGyX8VAjFDpQQQ2MNXiuFLQI5/rHy++UqVkSRN4ybZzTyLuBLd8S+lXbcZ8+wkV2tOYwgeqk9MFr5d3QJYqNl00I2zcXXOprkpjBymcdkLeQC6M0xWU+eNYI
 ::YB416Ek+ZG8=
 ::
 ::
@@ -35,33 +35,37 @@
 chcp 65001 > nul
 title Mushroom AI Diagnosis Service
 
-:: 1. Move to the directory where this batch file is located
-cd /d "%~dp0"
+:: 1. Set Path
+set "ROOT_DIR=%~dp0"
+set "PYTHON_EXE=%ROOT_DIR%py310\Scripts\python.exe"
 
-:: 2. Set the path - Check if the file actually exists
-set "PYTHON_EXE=%~dp0py310\Scripts\python.exe"
-
+:: 2. Check Python Environment
 if not exist "%PYTHON_EXE%" (
-    echo ==================================================
-    echo ??[Error] Cannot find python.exe at:
-    echo "%PYTHON_EXE%"
-    echo.
-    echo Please check if the virtual environment folder is named 'py310'
-    echo and if it contains 'Scripts\python.exe'.
-    echo ==================================================
-    pause
-    exit /b
+    echo [Error] Execution failed: Python environment not found at:
+    echo %PYTHON_EXE%
+    echo Please check if the 'py310' folder exists in the current directory.
+    pause & exit /b
 )
 
 echo ==================================================
-echo [System] Starting service using Virtual Environment...
+echo   [System] Initializing Mushroom AI Service...
+echo   [Status] Loading Models and Environment...
 echo ==================================================
 
-:: 3. Run Streamlit
-"%PYTHON_EXE%" -m streamlit run app\mushroom_detect_app.py --server.headless false
+:: 3. Change Directory to App
+cd /d "%ROOT_DIR%app"
 
-if %errorlevel% neq 0 (
-    echo.
-    echo ??[Error] Streamlit failed to run.
-    pause
-)
+:: 4. Run Streamlit App
+"%PYTHON_EXE%" -m streamlit run mushroom_detect_app.py --server.headless false
+
+:: 5. Cleanup on Exit
+echo ==================================================
+echo   [System] Shutting down the service...
+echo   [System] Cleaning up background processes...
+
+:: Force kill the specific python process tree
+taskkill /f /im python.exe /t >nul 2>&1
+
+echo   [Status] All processes terminated successfully.
+echo ==================================================
+exit

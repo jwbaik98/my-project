@@ -1,0 +1,10 @@
+[server]
+# 연결 유지 시간 대폭 증가 (기본값은 짧음)
+keepAliveInterval = 30
+# 브라우저가 응답을 기다리는 시간 설정
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+# 새로고침 시 데이터 유지력 강화
+gatherUsageStats = false

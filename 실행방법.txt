@@ -1,0 +1,5 @@
+[표고버섯AI판독기(LLM버전) 실행방법]
+
+1. 표고버섯AI판독기(LLM버전).exe 클릭
+
+2. 미실행시 mushroom_detect.bat파일 실행
