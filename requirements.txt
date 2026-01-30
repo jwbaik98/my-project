@@ -1,0 +1,16 @@
+# [핵심 실행 환경]
+streamlit
+ultralytics
+
+# [이미지 및 영상 처리]
+pillow
+opencv-python
+numpy
+
+# [AI 및 자연어 처리 (LLM/RAG)]
+llama-cpp-python
+sentence-transformers
+scikit-learn
+
+# [기타 유틸리티]
+python-dotenv
