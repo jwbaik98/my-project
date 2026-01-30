@@ -108,7 +108,13 @@ def init_all_models():
 
 yolo_model, embed_model, chunks, embeddings, llm_model = init_all_models()
 
-def search_rag(query, k=2):
+disease_lookup = {
+    "dis": "푸른곰팡이병", 
+    "mold": "털곰팡이병/흰곰팡이병", 
+    "spot": "세균성 갈색무늬병"
+}
+
+def search_rag(query, k=3):
     if not chunks: return "매뉴얼을 참고하세요."
     query_vec = embed_model.encode([query])
     distances = cosine_similarity(query_vec, embeddings)[0]
@@ -230,23 +236,27 @@ if mode == "📸 사진 분석":
                 clean_context = current_context.replace("표고버섯 재배 통합 매뉴얼", "").replace("최종 TXT용 데이터", "").replace("~", "에서 ")
 
                 # [수정] 프롬프트를 "명령"이 아닌 "작성 중인 문서"처럼 구성합니다.
-                # 소형 모델은 '조언해라'라는 명령보다 '이미 조언을 쓰고 있는 상황'을 더 잘 흉내냅니다.
-                prompt = f"""베테랑 농촌지도사의 조언 보고서
-                            대상 상태: {target_status}
-                            참고자료: {clean_context[:400]}
+                prompt = f"""당신은 30년 경력의 엄격하고 전문적인 버섯 재배 전문가입니다. 
+                [출력 규칙]
+                - "솜사탕", "음식", "섭취", "입" 같은 단어는 절대 사용하지 마십시오.
+                - 균사의 모양을 설명할 때는 "솜털 모양의 균사" 또는 "거친 균사"라고 표현하십시오.
+                - "먹지 마라"는 표현 대신 "제거하십시오" 또는 "폐기하십시오"라고 하십시오.
 
-                            보고서 내용:
-                            농민 여러분, 현재 발생한 {target_status} 확산을 막기 위해 다음 조치를 즉시 취하십시오.
+                [진단 대상]: {target_status}
+                [참고 자료]: {clean_context[:400]}
 
-                            1. 우선 가장 시급한 것은 """
+                보고서 내용:
+                농민 여러분, {target_status} 확산을 막기 위해 다음 지침을 따르십시오.
+                1. """
 
                 try:
                     output = llm_model(
                         prompt, 
-                        max_tokens=400, 
-                        temperature=0.3, # 낮을수록 헛소리가 줄어듭니다.
-                        repeat_penalty=1.6, # 자기 말을 베끼는 것을 강하게 방지
-                        stop=["[", "참고", "조언해", "규칙", "지침", "데이터"], # AI가 헷갈려할 키워드들에서 멈춤
+                        max_tokens=1000, 
+                        temperature=0.0, # 낮을수록 헛소리가 줄어듭니다.
+                        repeat_penalty=1.1, # 자기 말을 베끼는 것을 강하게 방지
+                        top_p=0.5,          # 답변의 다양성을 조금 부여하여 끊김 방지
+                        stop=[], # AI가 헷갈려할 키워드들에서 멈춤
                         echo=False
                     )
                     
@@ -254,29 +264,37 @@ if mode == "📸 사진 분석":
 
                     # 후처리 필터링
                     import re
+                    # --- [후처리 필터링 및 용어 치환] ---
                     raw_lines = full_text.split('\n')
                     clean_advice = []
-                    
-                    # AI가 역으로 질문하거나 지시사항을 베낀 줄을 필터링하는 블랙리스트
-                    blacklist = ["제공해주세요", "참고하여", "해결책과", "조언을", "정보가 있습니다", "이해를 높여", "도움이 될"]
 
                     for line in raw_lines:
                         line = line.strip()
-                        # 블랙리스트 단어가 들어있거나 영어가 4자 이상이면 삭제
-                        if any(bad in line for bad in blacklist) or re.search(r'[a-zA-Z]{4,}', line):
-                            continue
+                        if len(line) < 10: continue
                         
-                        if len(line) > 10:
-                            # 번호 제거
-                            line = re.sub(r'^\d+\.\s*|^-\s*', '', line)
-                            clean_advice.append(line)
+                        # [핵심] 식물 용어를 버섯 용어로 자동 강제 치환
+                        line = line.replace("잎과 줄기", "갓과 대").replace("잎에", "갓에").replace("줄기에", "대에").replace("식물", "버섯")
+                        line = line.replace("솜사탕을 섭취하지", "균사를 만지지")
+                        line = line.replace("솜사탕을", "균사를")
+                        line = line.replace("섭취한 사람들을", "오염된 배지를")
+                        line = line.replace("환부를", "오염 부위를")
+                        line = line.replace("식물", "버섯").replace("잎", "갓").replace("줄기", "대")
+                        if "사람" in line or "환자" in line:
+                            continue
+                                                
+                    # 4. [완성] 문장이 마침표로 끝나지 않았다면 강제로 마침표 추가
+                        if not line.endswith(('.', '!', '?')):
+                            line += " 하십시오."
+                        
+                        # 5. 번호 및 불필요한 서두 제거
+                        line = re.sub(r'^\d+\.\s*|^-\s*', '', line)
+                        
+                        clean_advice.append(line)
 
+                    # 최종 출력 구성
                     if len(clean_advice) >= 1:
                         final_output = f"🍄 **[AI 전문가 긴급 처방전: {target_status}]**\n\n"
-                        # 첫 문장에 유도구 생략되었을 경우 보정
-                        if not clean_advice[0].startswith("우선 가장 시급한 것은"):
-                            clean_advice[0] = "우선 가장 시급한 것은 " + clean_advice[0]
-                            
+                        # AI가 쓴 글을 최대한 살리되, 번호만 예쁘게 매깁니다.
                         for idx, advice in enumerate(clean_advice[:4]):
                             final_output += f"{idx+1}. {advice}\n\n"
                         ans = final_output
@@ -346,19 +364,26 @@ elif mode == "📹 실시간 영상":
                         # 상태가 변했을 때만 AI 처방전 갱신
                         with st.spinner(f"⚕️ {d_name} 대응 지침 생성 중..."):
                             current_context = search_rag(d_name)
-                            prompt = f"""베테랑 농촌지도사의 조언
-상태: {d_name}
-지침: {current_context[:300]}
+                            prompt = f"""당신은 30년 경력의 엄격하고 전문적인 버섯 재배 전문가입니다. 
+                                [출력 규칙]
+                                - "솜사탕", "음식", "섭취", "입" 같은 단어는 절대 사용하지 마십시오.
+                                - 균사의 모양을 설명할 때는 "솜털 모양의 균사" 또는 "거친 균사"라고 표현하십시오.
+                                - "먹지 마라"는 표현 대신 "제거하십시오" 또는 "폐기하십시오"라고 하십시오.
 
-보고서:
-농민 여러분, {d_name} 방제를 위해 다음을 실천하세요.
-1. """
+                                [진단 대상]: {d_name}
+                                [참고 자료]: {current_context[:400]}
+
+                                보고서 내용:
+                                농민 여러분, {d_name} 확산을 막기 위해 다음 지침을 따르십시오.
+                                1. """
                             try:
                                 output = llm_model(
                                     prompt, 
-                                    max_tokens=200, # 속도를 위해 토큰 수 제한
-                                    temperature=0.2,
-                                    stop=["3.", "###"], # 짧고 굵게 2가지만 출력
+                                    max_tokens=400, # 속도를 위해 토큰 수 제한
+                                    temperature=0.0, # 낮을수록 헛소리가 줄어듭니다.
+                                    repeat_penalty=1.1, # 자기 말을 베끼는 것을 강하게 방지
+                                    top_p=0.5,          # 답변의 다양성을 조금 부여하여 끊김 방지
+                                    stop=[], # AI가 헷갈려할 키워드들에서 멈춤
                                     echo=False
                                 )
                                 ans_text = "1. " + output['choices'][0]['text'].strip()
